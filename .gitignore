@@ -1,0 +1,40 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.env
+*.db
+*.sqlite3
+*.bak
+models/
+*.joblib
+.DS_Store
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+node_modules/
+dist/
+build/
+benchmark/results/
+lab_files/outbox.log
+
+lab_files/sandbox/
+models/phase6-temp/
+
+# Environment variants and secrets
+.env.*
+!.env.example
+
+# Additional database formats
+*.sqlite
+
+# Private keys and certificates
+*.pem
+*.key
+
+# Secret directories
+secrets/
+
+# Local project backups
+PHASE_10_4_BACKUP/

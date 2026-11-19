@@ -1,0 +1,2 @@
+# Phase 7 uses the project's single, pinned dependency manifest.
+-r requirements.txt

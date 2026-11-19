@@ -1,0 +1,19 @@
+# Run from repository root: docker compose -f lab/docker-compose.yml run --rm lab-mcp-server
+# No published ports and no network. The scenario runner can run on the host;
+# the container service is provided for isolated manual lab inspection.
+services:
+  lab-mcp-server:
+    build:
+      context: ..
+      dockerfile: lab/docker/Dockerfile
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 64
+    mem_limit: 256m
+    command: ["python", "mcp_lab/vulnerable_server.py"]
