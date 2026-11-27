@@ -38,3 +38,6 @@ secrets/
 
 # Local project backups
 PHASE_10_4_BACKUP/
+.agentsentry_users.sqlite3
+.agentsentry_session_secret
+.agentsentry_users.sqlite3-*

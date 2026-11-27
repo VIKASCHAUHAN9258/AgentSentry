@@ -1,49 +1,63 @@
-# API authentication
+# AgentSentry account authentication
 
-The Flask API requires a bearer key for every `/api/*` route except
-`/api/health` and `/api/auth/status`. `/api/auth/verify` is itself protected.
-The key is read from `AGENTSENTRY_API_KEY`; application startup fails if it is
-missing or shorter than 32 characters. Authentication cannot be disabled
-outside explicit Flask test mode.
+The local dashboard uses account-based sign-up and sign-in. Browser users do
+not need to paste `AGENTSENTRY_API_KEY` after every restart.
 
-## Local setup
+## Local accounts
 
-Set a randomly generated key in the process environment or in a private `.env`
-file. For example, in PowerShell, generate a fresh key without printing it and
-start Flask in the same terminal:
+- Create an account from the dashboard using a name, email address, and a
+  password of at least 12 characters.
+- Passwords are stored as Werkzeug `scrypt` password hashes. Plain-text
+  passwords are never stored or returned by the API.
+- Accounts live in `.agentsentry_users.sqlite3`, separate from the read-only
+  telemetry database `agentsentry.db`.
+- Successful sign-in creates a signed, HTTP-only, `SameSite=Lax` browser
+  session cookie. Local sessions expire after seven days.
+- The Flask cookie-signing secret is generated once in
+  `.agentsentry_session_secret` and reused across backend restarts. Keep both
+  local files out of source control and do not delete the secret file while
+  active browser sessions need to remain valid.
+- Sign out clears the browser session. The account itself remains available
+  for the next sign-in.
+
+The API exposes `GET /api/auth/status`, `POST /api/auth/signup`,
+`POST /api/auth/login`, `POST /api/auth/logout`, and `GET /api/auth/verify`.
+Mutating cookie-authenticated requests require a session-bound CSRF token.
+The API accepts browser requests only from the exact origins configured in
+`AGENTSENTRY_CORS_ORIGINS` (by default the two local Vite origins).
+
+## Optional service bearer key
+
+`AGENTSENTRY_API_KEY` remains an optional compatibility mechanism for trusted
+non-browser clients that already use bearer authentication. It is not needed
+for the React dashboard or ordinary local start-up. When configured, it must
+contain at least 32 characters. Do not embed it in frontend code.
+
+## Local start-up
+
+From the project root in PowerShell:
 
 ```powershell
-$env:AGENTSENTRY_API_KEY = (& .\venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(48))")
-.\venv\Scripts\python.exe -m flask --app api.app:create_app run --host 127.0.0.1 --port 5000
+.\venv\Scripts\Activate.ps1
+python -m api.app
 ```
 
-The Flask CLI loads `.env` when `python-dotenv` is installed. Do not overwrite
-an existing `.env`; keep the API key out of source control, logs, screenshots,
-and support reports.
+In a second terminal:
 
-The dashboard asks the operator for this key, verifies it against the API, and
-keeps it in JavaScript memory only. It is not compiled into the frontend and is
-not written to local or session storage. Reloading the page requires entering
-the key again. Locking the dashboard clears the in-memory key and React Query
-cache. Public health/auth-status requests do not send the key.
+```powershell
+cd dashboard
+npm run dev
+```
 
-## Browser origins and boundaries
+Open `http://127.0.0.1:5173/`, choose **Create account** for the first use,
+and then use **Sign in** on later visits. No API key is pasted into the
+browser. The local session and account database persist across restarts.
 
-`AGENTSENTRY_CORS_ORIGINS` is a comma-separated exact-origin allowlist. It
-defaults to `http://127.0.0.1:5173,http://localhost:5173`. Configure it to
-include only trusted dashboard origins. Wildcard origins are not used.
-Requests carrying an origin outside the list are rejected; preflight requests
-are handled before bearer authentication, while actual protected requests still
-require the key.
+## Security boundary
 
-The API binds to loopback in the documented development command. Bearer-key
-authentication is a local-operator boundary, not a multi-user identity,
-role-based authorization, or production deployment design. Do not expose the
-Flask development server directly to an untrusted network. A networked
-deployment needs a separately reviewed TLS, identity, authorization, secret
-rotation, and operational logging design.
-
-## Checks
-
-The API tests cover missing, invalid, and valid credentials, public endpoints,
-production startup configuration, and CORS allow/deny and preflight behavior.
+The Flask development server binds to loopback in the documented command.
+This account system is intended for a local development/demo environment. It
+is not a reviewed public multi-tenant identity service. Do not expose the
+Flask development server to an untrusted network. A networked deployment needs
+TLS, registration controls, rate limiting, recovery flows, account lifecycle
+management, and a separately reviewed operational security design.

@@ -14,8 +14,88 @@ export interface HealthResponse {
   database: "connected" | "unavailable" | "schema_unavailable";
 }
 
+export interface AuthUser {
+  id: number;
+  name: string;
+  email: string;
+}
+
 export interface AuthStatusResponse {
   required: boolean;
+  authenticated: boolean;
+  user: AuthUser | null;
+  csrf_token: string;
+}
+
+export interface AuthResult {
+  authenticated: true;
+  user: AuthUser;
+  csrf_token: string;
+}
+
+export interface DemoScenarioInfo {
+  id: string;
+  name: string;
+  agent_id: string;
+  description: string;
+  event_count: number;
+  classification: "SIMULATED";
+}
+
+export interface DemoSession {
+  scenario_id: string;
+  scenario_name: string;
+  description: string;
+  agent_id: string;
+  session: SessionRecord;
+  calls: ToolCall[];
+  assessment: SessionAssessment;
+  review: SessionReviewStatus;
+  classification: "SIMULATED";
+}
+
+export interface DemoAlert {
+  alert_id: string;
+  run_id: string;
+  scenario_id: string;
+  scenario_name: string;
+  agent_id: string;
+  session_id: string;
+  risk_level: string;
+  risk_score: number | null;
+  why_flagged: string[];
+  contributing_signals: ContributingSignal[];
+  classification: "SIMULATED";
+}
+
+export interface DemoMetrics {
+  sessions_total: number;
+  tool_calls_total: number;
+  agents_total: number;
+  alerts_total: number;
+}
+
+export interface DemoData {
+  enabled: boolean;
+  classification: "SIMULATED";
+  model_disclosure: string;
+  scenarios: DemoScenarioInfo[];
+  active_run: {
+    run_id: string;
+    created_at: number;
+    scenarios: DemoSession[];
+  } | null;
+  metrics: DemoMetrics;
+  alerts: DemoAlert[];
+}
+
+export interface DemoReviewResult {
+  session_id: string;
+  agent_id: string;
+  decision: "approved" | "rejected";
+  reviewer: string;
+  reviewed_at: number;
+  evidence_sha256: string;
 }
 
 export interface AgentSummary {

@@ -3,9 +3,10 @@
 ## Assessment
 
 **Not ready for internet-facing or untrusted multi-user deployment.** The
-backend and dashboard changes are locally verified, API access now requires a
-bearer key, and the existing SQLite database was backed up before additive
-indexes were applied. However, npm still reports five HIGH findings for an
+base telemetry backend and dashboard were locally verified before this account
+authentication update. The account sign-up/sign-in change still requires a
+local end-to-end verification run. The existing SQLite telemetry database is
+kept separate from the new user database. npm still reports five HIGH findings for an
 unpatched transitive ReDoS advisory, model artifacts use pickle-based
 deserialization, and the Flask development server is not a production server.
 Use only as a trusted local developer deployment until the outstanding
@@ -13,12 +14,12 @@ boundaries are addressed.
 
 ## Completed work
 
-- Added required API-key authentication outside tests. The key must be at
-  least 32 characters, is compared in constant time, and protects API routes
-  except health and auth-status. CORS uses an explicit origin allowlist.
-- Added a dashboard credential gate. The operator enters the API key; it is
-  held in tab memory only, not bundled or persisted. Locking clears the key and
-  query cache.
+- Added local account sign-up/sign-in with scrypt password hashes, a separate
+  user SQLite database, signed HTTP-only session cookies, CSRF checks, and a
+  persistent local cookie-signing secret. Browser users no longer enter an API
+  key on each restart.
+- Retained an optional constant-time bearer-key path for trusted non-browser
+  clients. CORS continues to use an explicit origin allowlist.
 - Hardened model artifact handling with model-directory and artifact path
   checks, symbolic-link/Windows-junction rejection where supported, a 100 MiB
   size limit, schema/metadata validation, digest checking, and clearer
@@ -151,20 +152,19 @@ and [`MODEL_SECURITY.md`](MODEL_SECURITY.md) for operational boundaries.
 
 ## Local startup
 
-From `D:\AGENT_SENTRY`, with the existing virtual environment, database, and
-private `.env` configured:
+From `D:\AGENT_SENTRY`, with the existing virtual environment and telemetry
+database:
 
 ```powershell
-.\venv\Scripts\python.exe -m flask --app api.app:create_app run --host 127.0.0.1 --port 5000
+.\venv\Scripts\Activate.ps1
+python -m api.app
 ```
 
-Set `AGENTSENTRY_API_KEY` in the environment or private `.env` first; it must
-be a random value of at least 32 characters. To generate a fresh key in the
-same PowerShell terminal without printing it:
-
-```powershell
-$env:AGENTSENTRY_API_KEY = (& .\venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(48))")
-```
+The backend creates `.agentsentry_session_secret` once and reuses it so the
+signed browser session survives ordinary restarts. The first account is
+created from the dashboard's **Create account** link; user records and scrypt
+password hashes are stored in `.agentsentry_users.sqlite3`, separate from
+`agentsentry.db`.
 
 In another terminal:
 
@@ -173,7 +173,7 @@ Set-Location D:\AGENT_SENTRY\dashboard
 npm run dev
 ```
 
-Open `http://127.0.0.1:5173/` and enter the API key when prompted. Keep Flask
-bound to loopback. Do not replace `.env` or reset/replace `agentsentry.db`.
-Run the backend and dashboard checks from the commands in
-[`README.md`](../README.md) before distributing a release.
+Open `http://127.0.0.1:5173/`. Use **Create account** on first use and **Sign
+in** on subsequent visits. No browser API key is required. Keep Flask bound to
+loopback and do not replace `.agentsentry_session_secret`,
+`.agentsentry_users.sqlite3`, or `agentsentry.db` during normal restarts.

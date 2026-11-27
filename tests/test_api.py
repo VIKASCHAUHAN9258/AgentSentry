@@ -216,7 +216,11 @@ def test_api_authentication_protects_sensitive_routes_but_not_health(tmp_path):
     http = app.test_client()
 
     assert http.get("/api/health").status_code == 200
-    assert http.get("/api/auth/status").json == {"required": True}
+    auth_status = http.get("/api/auth/status").json
+    assert auth_status["required"] is True
+    assert auth_status["authenticated"] is False
+    assert auth_status["user"] is None
+    assert len(auth_status["csrf_token"]) >= 32
     protected_paths = (
         "/api/agents",
         "/api/sessions",
@@ -266,6 +270,8 @@ def test_api_cors_preflight_is_limited_to_configured_origin(tmp_path):
     assert allowed.status_code == 204
     assert allowed.headers["Access-Control-Allow-Origin"] == "http://127.0.0.1:5173"
     assert "Authorization" in allowed.headers["Access-Control-Allow-Headers"]
+    assert "X-CSRF-Token" in allowed.headers["Access-Control-Allow-Headers"]
+    assert allowed.headers["Access-Control-Allow-Credentials"] == "true"
 
     denied = http.options(
         "/api/agents",
@@ -360,13 +366,25 @@ def test_default_app_is_not_in_debug_mode(tmp_path):
     assert app.config["DEBUG"] is False
 
 
-def test_non_test_app_refuses_missing_or_disabled_authentication(tmp_path):
-    with pytest.raises(RuntimeError, match="AGENTSENTRY_API_KEY"):
-        create_app({"DATABASE": str(tmp_path / "missing-key.db")})
+def test_non_test_app_creates_persistent_session_secret_without_browser_api_key(tmp_path):
+    secret_file = tmp_path / "session.secret"
+    config = {
+        "DATABASE": str(tmp_path / "telemetry.db"),
+        "AUTH_DATABASE": str(tmp_path / "users.sqlite3"),
+        "SESSION_SECRET_FILE": str(secret_file),
+    }
+    first = create_app(config)
+    second = create_app(config)
+    assert first.config["SECRET_KEY"] == second.config["SECRET_KEY"]
+    assert len(first.config["SECRET_KEY"]) >= 32
+    assert secret_file.is_file()
+    assert first.debug is False
+    assert first.config["DEBUG"] is False
+
     with pytest.raises(RuntimeError, match="only be disabled"):
         create_app(
             {
-                "DATABASE": str(tmp_path / "auth-disabled.db"),
+                **config,
                 "AUTH_REQUIRED": False,
             }
         )

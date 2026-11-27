@@ -1,8 +1,14 @@
 import type {
   ActivityItem,
   AgentSummary,
+  AuthResult,
   AuthStatusResponse,
   AttackChainFinding,
+  DemoAlert,
+  DemoData,
+  DemoReviewResult,
+  DemoScenarioInfo,
+  DemoSession,
   DashboardOverview,
   HealthResponse,
   McpServerInventoryItem,
@@ -10,6 +16,7 @@ import type {
   RiskDistribution,
   SessionAssessment,
   SessionDetailResponse,
+  SessionReviewStatus,
   SessionSummary,
   ToolCall,
   ToolDefinitionEvent,
@@ -25,11 +32,7 @@ export class ApiError extends Error {
   }
 }
 
-let apiKey: string | null = null;
-
-export function setApiKey(value: string | null): void {
-  apiKey = value;
-}
+let csrfToken: string | null = null;
 
 type PayloadGuard<T> = (payload: unknown) => payload is T;
 
@@ -57,8 +60,109 @@ function isHealthResponse(value: unknown): value is HealthResponse {
       value.database === "schema_unavailable");
 }
 
+function isAuthUser(value: unknown): value is { id: number; name: string; email: string } {
+  return isRecord(value) &&
+    isFiniteNumber(value.id) &&
+    isString(value.name) &&
+    isString(value.email);
+}
+
 function isAuthStatusResponse(value: unknown): value is AuthStatusResponse {
-  return isRecord(value) && typeof value.required === "boolean";
+  return isRecord(value) &&
+    typeof value.required === "boolean" &&
+    typeof value.authenticated === "boolean" &&
+    (value.user === null || isAuthUser(value.user)) &&
+    isString(value.csrf_token);
+}
+
+function isAuthResult(value: unknown): value is AuthResult {
+  return isRecord(value) &&
+    value.authenticated === true &&
+    isAuthUser(value.user) &&
+    isString(value.csrf_token);
+}
+
+function isDemoScenarioInfo(value: unknown): value is DemoScenarioInfo {
+  return isRecord(value) &&
+    isString(value.id) &&
+    isString(value.name) &&
+    isString(value.agent_id) &&
+    isString(value.description) &&
+    isFiniteNumber(value.event_count) &&
+    value.classification === "SIMULATED";
+}
+
+function isDemoReview(value: unknown): value is SessionReviewStatus {
+  return isRecord(value) &&
+    (value.decision === "unreviewed" || value.decision === "approved" || value.decision === "rejected") &&
+    (value.reviewer === null || isString(value.reviewer)) &&
+    isNullableNumber(value.reviewed_at) &&
+    isString(value.review_note) &&
+    typeof value.evidence_current === "boolean";
+}
+
+function isDemoSession(value: unknown): value is DemoSession {
+  return isRecord(value) &&
+    isString(value.scenario_id) &&
+    isString(value.scenario_name) &&
+    isString(value.description) &&
+    isString(value.agent_id) &&
+    isRecord(value.session) &&
+    isString(value.session.session_id) &&
+    isString(value.session.agent_id) &&
+    isFiniteNumber(value.session.started_at) &&
+    isNullableNumber(value.session.ended_at) &&
+    Array.isArray(value.calls) &&
+    value.calls.every(isToolCall) &&
+    isSessionAssessment(value.assessment) &&
+    isDemoReview(value.review) &&
+    value.classification === "SIMULATED";
+}
+
+function isDemoAlert(value: unknown): value is DemoAlert {
+  return isRecord(value) &&
+    isString(value.alert_id) &&
+    isString(value.run_id) &&
+    isString(value.scenario_id) &&
+    isString(value.scenario_name) &&
+    isString(value.agent_id) &&
+    isString(value.session_id) &&
+    isString(value.risk_level) &&
+    isNullableNumber(value.risk_score) &&
+    Array.isArray(value.why_flagged) &&
+    value.why_flagged.every(isString) &&
+    Array.isArray(value.contributing_signals) &&
+    value.contributing_signals.every(isContributingSignal) &&
+    value.classification === "SIMULATED";
+}
+
+function isDemoData(value: unknown): value is DemoData {
+  if (!isRecord(value) || typeof value.enabled !== "boolean" ||
+      value.classification !== "SIMULATED" || !isString(value.model_disclosure) ||
+      !Array.isArray(value.scenarios) || !value.scenarios.every(isDemoScenarioInfo) ||
+      !isRecord(value.metrics) || !isFiniteNumber(value.metrics.sessions_total) ||
+      !isFiniteNumber(value.metrics.tool_calls_total) ||
+      !isFiniteNumber(value.metrics.agents_total) ||
+      !isFiniteNumber(value.metrics.alerts_total) ||
+      !Array.isArray(value.alerts) || !value.alerts.every(isDemoAlert)) {
+    return false;
+  }
+  if (value.active_run === null) return true;
+  return isRecord(value.active_run) &&
+    isString(value.active_run.run_id) &&
+    isFiniteNumber(value.active_run.created_at) &&
+    Array.isArray(value.active_run.scenarios) &&
+    value.active_run.scenarios.every(isDemoSession);
+}
+
+function isDemoReviewResult(value: unknown): value is DemoReviewResult {
+  return isRecord(value) &&
+    isString(value.session_id) &&
+    isString(value.agent_id) &&
+    (value.decision === "approved" || value.decision === "rejected") &&
+    isString(value.reviewer) &&
+    isFiniteNumber(value.reviewed_at) &&
+    isString(value.evidence_sha256);
 }
 
 function isAgentSummary(value: unknown): value is AgentSummary {
@@ -291,15 +395,10 @@ function isToolDefinitionEventList(value: unknown): value is ToolDefinitionEvent
   return Array.isArray(value) && value.every(isToolDefinitionEvent);
 }
 
-async function getJson<T>(
-  path: string,
-  isPayload: PayloadGuard<T>,
-  authenticated = true,
-): Promise<T> {
-  const headers: Record<string, string> = { Accept: "application/json" };
-  if (authenticated && apiKey) headers.Authorization = `Bearer ${apiKey}`;
+async function getJson<T>(path: string, isPayload: PayloadGuard<T>): Promise<T> {
   const response = await fetch(path, {
-    headers,
+    headers: { Accept: "application/json" },
+    credentials: "include",
   });
 
   let payload: unknown;
@@ -323,7 +422,38 @@ async function getJson<T>(
   if (!isPayload(payload)) {
     throw new ApiError("The API returned data in an unexpected format.", response.status);
   }
+  return payload;
+}
 
+async function postJson<T>(
+  path: string,
+  body: Record<string, unknown>,
+  isPayload: PayloadGuard<T>,
+): Promise<T> {
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    "Content-Type": "application/json",
+  };
+  if (csrfToken) headers["X-CSRF-Token"] = csrfToken;
+  const response = await fetch(path, {
+    method: "POST",
+    credentials: "include",
+    headers,
+    body: JSON.stringify(body),
+  });
+  const payload: unknown = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message = isRecord(payload) && isString(payload.error)
+      ? payload.error
+      : `The API request failed with status ${response.status}.`;
+    throw new ApiError(message, response.status);
+  }
+  if (!isPayload(payload)) {
+    throw new ApiError("The API returned data in an unexpected format.", response.status);
+  }
+  if (isRecord(payload) && isString(payload.csrf_token)) {
+    csrfToken = payload.csrf_token;
+  }
   return payload;
 }
 
@@ -337,14 +467,50 @@ function withQuery(path: string, params: Record<string, string | number | undefi
 }
 
 export const api = {
-  health: () => getJson<HealthResponse>("/api/health", isHealthResponse, false),
-  authStatus: () =>
-    getJson<AuthStatusResponse>("/api/auth/status", isAuthStatusResponse, false),
+  health: () => getJson<HealthResponse>("/api/health", isHealthResponse),
+  authStatus: async () => {
+    const status = await getJson<AuthStatusResponse>("/api/auth/status", isAuthStatusResponse);
+    csrfToken = status.csrf_token;
+    return status;
+  },
+  signup: (input: { name: string; email: string; password: string }) =>
+    postJson<AuthResult>("/api/auth/signup", input, isAuthResult),
+  login: (input: { email: string; password: string }) =>
+    postJson<AuthResult>("/api/auth/login", input, isAuthResult),
+  logout: async () => {
+    await postJson<{ logged_out: boolean }>(
+      "/api/auth/logout",
+      {},
+      (value): value is { logged_out: boolean } =>
+        isRecord(value) && value.logged_out === true,
+    );
+    csrfToken = null;
+  },
   verifyAuth: () =>
-    getJson<{ authenticated: boolean }>(
+    getJson<{ authenticated: boolean; user?: unknown }>(
       "/api/auth/verify",
-      (value): value is { authenticated: boolean } =>
+      (value): value is { authenticated: boolean; user?: unknown } =>
         isRecord(value) && value.authenticated === true,
+    ),
+  demo: () => getJson<DemoData>("/api/demo", isDemoData),
+  loadDemo: (input: { scenario_id?: string } = {}) =>
+    postJson<DemoData>("/api/demo/load", input, isDemoData),
+  resetDemo: (runId: string) =>
+    postJson<DemoData>("/api/demo/reset", { run_id: runId }, isDemoData),
+  reviewDemoSession: (
+    runId: string,
+    sessionId: string,
+    input: {
+      decision: "approved" | "rejected";
+      reviewer: string;
+      note: string;
+      confirm_reviewed: true;
+    },
+  ) =>
+    postJson<DemoReviewResult>(
+      `/api/demo/runs/${encodeURIComponent(runId)}/sessions/${encodeURIComponent(sessionId)}/review`,
+      input,
+      isDemoReviewResult,
     ),
   agents: () => getJson<AgentSummary[]>("/api/agents", (value): value is AgentSummary[] =>
     Array.isArray(value) && value.every(isAgentSummary),
@@ -383,8 +549,9 @@ export const api = {
       headers: {
         Accept: "application/json",
         "Content-Type": "application/json",
-        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
       },
+      credentials: "include",
       body: JSON.stringify(input),
     });
     const payload: unknown = await response.json().catch(() => null);

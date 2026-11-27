@@ -5,24 +5,26 @@ import {
   Command,
   FileSearch,
   LayoutDashboard,
+  LogOut,
+  LockKeyhole,
   Menu,
   RadioTower,
   RefreshCw,
   Search,
   ShieldCheck,
-  LockKeyhole,
   X,
 } from "lucide-react";
 import { useState, type FormEvent, type ReactNode } from "react";
 import { NavLink, useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, ApiError, setApiKey } from "../api/client";
+import { api } from "../api/client";
 import { useHealth } from "../api/queries";
 import { AppRoutes } from "./routes";
 
 const navigation = [
   { to: "/", label: "Overview", icon: LayoutDashboard, end: true },
   { to: "/sessions", label: "Agent sessions", icon: RadioTower },
+  { to: "/demo", label: "SOC Demo Mode", icon: Activity },
   { to: "/investigations", label: "Investigations", icon: FileSearch },
   { to: "/mcp", label: "MCP security", icon: Boxes },
 ];
@@ -30,6 +32,7 @@ const navigation = [
 const pageTitles: Record<string, string> = {
   "/": "Incident Management",
   "/sessions": "Agent sessions",
+  "/demo": "SOC Demo Mode",
   "/investigations": "Investigations",
   "/mcp": "MCP security",
 };
@@ -71,9 +74,12 @@ function Brand({ children }: { children?: ReactNode }) {
 export function App() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [commandSearch, setCommandSearch] = useState("");
-  const [apiKeyInput, setApiKeyInput] = useState("");
-  const [authenticated, setAuthenticated] = useState(false);
+  const [authMode, setAuthMode] = useState<"signin" | "signup">("signin");
+  const [fullName, setFullName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [authError, setAuthError] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
   const location = useLocation();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -84,6 +90,8 @@ export function App() {
     retry: 0,
   });
   const authRequired = authStatus.data?.required ?? true;
+  const authenticated = authStatus.data?.authenticated ?? false;
+  const user = authStatus.data?.user ?? null;
   const pageTitle =
     location.pathname.startsWith("/sessions/") && location.pathname !== "/sessions"
       ? "Session investigation"
@@ -104,33 +112,36 @@ export function App() {
     navigate(query ? `/sessions?${query}` : "/sessions");
   };
 
-  const submitApiKey = async (event: FormEvent<HTMLFormElement>) => {
+  const submitCredentials = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setAuthError("");
-    setApiKey(apiKeyInput);
+    setAuthBusy(true);
     try {
-      await api.verifyAuth();
-      setApiKeyInput("");
-      setAuthenticated(true);
-      queryClient.clear();
+      if (authMode === "signup") {
+        await api.signup({ name: fullName.trim(), email: email.trim(), password });
+      } else {
+        await api.login({ email: email.trim(), password });
+      }
+      setPassword("");
+      setFullName("");
+      await authStatus.refetch();
+      await queryClient.invalidateQueries();
     } catch (error) {
-      setApiKey(null);
-      setAuthenticated(false);
-      setAuthError(
-        error instanceof ApiError && error.status === 401
-          ? "The API key was not accepted."
-          : error instanceof Error
-            ? error.message
-            : "Unable to verify API access.",
-      );
+      setAuthError(error instanceof Error ? error.message : "Authentication failed. Try again.");
+    } finally {
+      setAuthBusy(false);
     }
   };
 
-  const lockDashboard = () => {
-    setApiKey(null);
-    setAuthenticated(false);
-    setApiKeyInput("");
-    queryClient.clear();
+  const signOut = async () => {
+    setAuthError("");
+    try {
+      await api.logout();
+      queryClient.removeQueries({ predicate: (query) => query.queryKey[0] !== "auth" });
+      await authStatus.refetch();
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "Unable to sign out. Try again.");
+    }
   };
 
   const showDashboard = !authRequired || authenticated;
@@ -242,13 +253,9 @@ export function App() {
               <span>Refresh</span>
             </button>
             {authRequired && authenticated && (
-              <button
-                className="as-command-refresh"
-                onClick={lockDashboard}
-                type="button"
-              >
-                <LockKeyhole size={14} aria-hidden="true" />
-                <span>Lock</span>
+              <button className="as-command-refresh" onClick={() => void signOut()} type="button">
+                <LogOut size={14} aria-hidden="true" />
+                <span>Sign out{user ? ` · ${user.name}` : ""}</span>
               </button>
             )}
           </div>
@@ -258,7 +265,7 @@ export function App() {
           </div>
         </header>
         {authStatus.isPending ? (
-          <section className="as-auth-gate" role="status">Checking API access…</section>
+          <section className="as-auth-gate" role="status">Checking your AgentSentry session…</section>
         ) : authStatus.error ? (
           <section className="as-auth-gate" role="alert">
             <h1>API unavailable</h1>
@@ -269,23 +276,71 @@ export function App() {
           <AppRoutes />
         ) : (
           <section className="as-auth-gate">
-            <form className="as-auth-card" onSubmit={(event) => void submitApiKey(event)}>
-              <LockKeyhole size={24} aria-hidden="true" />
-              <h1>Authenticate to AgentSentry</h1>
-              <p>Enter the API key configured for the local AgentSentry service.</p>
-              <label htmlFor="agentsentry-api-key">API key</label>
+            <form className="as-auth-card" onSubmit={(event) => void submitCredentials(event)}>
+              <div className="as-auth-brand-mark"><ShieldCheck size={25} aria-hidden="true" /></div>
+              <span className="as-auth-eyebrow">LOCAL SECURITY CONSOLE</span>
+              <h1>{authMode === "signup" ? "Create your account" : "Welcome back"}</h1>
+              <p>
+                {authMode === "signup"
+                  ? "Create your analyst account to access the AgentSentry monitoring workspace."
+                  : "Sign in to continue to your AgentSentry security workspace."}
+              </p>
+              {authMode === "signup" && (
+                <>
+                  <label htmlFor="agentsentry-name">Full name</label>
+                  <input
+                    id="agentsentry-name"
+                    autoComplete="name"
+                    maxLength={80}
+                    onChange={(event) => setFullName(event.currentTarget.value)}
+                    placeholder="Your name"
+                    value={fullName}
+                    required
+                  />
+                </>
+              )}
+              <label htmlFor="agentsentry-email">Email address</label>
               <input
-                autoComplete="off"
+                id="agentsentry-email"
+                type="email"
+                autoComplete="email"
                 autoCapitalize="none"
-                id="agentsentry-api-key"
-                onChange={(event) => setApiKeyInput(event.currentTarget.value)}
+                maxLength={254}
+                onChange={(event) => setEmail(event.currentTarget.value)}
+                placeholder="analyst@example.com"
+                value={email}
+                required
+              />
+              <label htmlFor="agentsentry-password">Password</label>
+              <input
+                id="agentsentry-password"
                 type="password"
-                value={apiKeyInput}
+                autoComplete={authMode === "signup" ? "new-password" : "current-password"}
+                minLength={12}
+                maxLength={128}
+                onChange={(event) => setPassword(event.currentTarget.value)}
+                placeholder={authMode === "signup" ? "At least 12 characters" : "Your password"}
+                value={password}
                 required
               />
               {authError && <p className="as-auth-error" role="alert">{authError}</p>}
-              <button type="submit" disabled={!apiKeyInput}>Connect</button>
-              <small>The key is held in tab memory only and is not stored in the browser.</small>
+              <button className="as-auth-submit" type="submit" disabled={authBusy || !email || !password || (authMode === "signup" && !fullName.trim())}>
+                {authBusy ? "Please wait…" : authMode === "signup" ? "Create account" : "Sign in"}
+              </button>
+              <div className="as-auth-switch-row">
+                <span>{authMode === "signup" ? "Already have an account?" : "New to AgentSentry?"}</span>
+                <button
+                  className="as-auth-switch"
+                  type="button"
+                  onClick={() => {
+                    setAuthMode(authMode === "signup" ? "signin" : "signup");
+                    setAuthError("");
+                  }}
+                >
+                  {authMode === "signup" ? "Sign in" : "Create account"}
+                </button>
+              </div>
+              <small className="as-auth-security-note"><LockKeyhole size={12} /> Passwords are securely hashed. Your session is kept in an HTTP-only cookie.</small>
             </form>
           </section>
         )}

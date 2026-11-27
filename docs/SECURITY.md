@@ -1,9 +1,9 @@
 # AgentSentry security
 
 This document records the current security boundaries and known limitations.
-AgentSentry is a local monitoring prototype with bearer-key API access; it is
-not a multi-user identity system or a substitute for isolating the monitored
-agent.
+AgentSentry is a local monitoring prototype with local account sessions and
+an optional bearer-key compatibility path; it is not a production identity
+service or a substitute for isolating the monitored agent.
 
 ## Security controls
 
@@ -15,10 +15,11 @@ agent.
   API/access-key labels.
 - Flask rejects oversized request bodies with a JSON 413 response and sends
   restrictive content/security headers.
-- Flask requires a randomly generated bearer key of at least 32 characters
-  outside tests, compares it in constant time, and applies an exact-origin
-  CORS allowlist. The dashboard key is entered by the operator and held only
-  in tab memory. This is not a production identity or authorization system;
+- Browser users sign up/sign in with scrypt password hashes and signed,
+  HTTP-only, `SameSite=Lax` session cookies. Cookie-authenticated mutations
+  require a session-bound CSRF token, and browser origins are checked against
+  an exact allowlist. A persistent local secret signs sessions across backend
+  restarts. An optional bearer key remains for trusted non-browser clients;
   see [`API_AUTHENTICATION.md`](API_AUTHENTICATION.md).
 - Deterministic policy violations override the statistical detector. Unknown
   tool names default to NETWORK privilege.
@@ -64,9 +65,10 @@ the installed environment and lock/pin set when dependencies change.
 
 ## Application trust boundaries and limitations
 
-- The bearer key is a shared local-operator credential; there are no individual
-  identities, roles, or per-resource authorization rules. Bind Flask to
-  loopback and do not expose it directly to a network. Review the
+- Local accounts provide individual sign-in identities but there are no
+  roles, account recovery, registration approval, or per-resource authorization
+  rules. Anyone with local dashboard access can register an account. Bind
+  Flask to loopback and do not expose it directly to a network. Review the
   [`API_AUTHENTICATION.md`](API_AUTHENTICATION.md) deployment boundary before
   changing that scope.
 - A monitored MCP proxy records tool behavior; it does not sandbox arbitrary

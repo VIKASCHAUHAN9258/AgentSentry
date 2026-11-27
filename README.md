@@ -107,10 +107,11 @@ the investigation workflow.
 
 - Attack scenarios are simulation-only and do not establish production
   detection accuracy.
-- The Flask API requires a configured bearer API key outside tests. The
-  dashboard prompts for the key and keeps it in tab memory only. This is a
-  local-operator control, not a multi-user identity or authorization system;
-  keep the API bound to loopback.
+- The dashboard uses local sign-up/sign-in accounts with scrypt password
+  hashes and signed HTTP-only session cookies. Accounts are stored separately
+  from telemetry in `.agentsentry_users.sqlite3`; the signing secret persists
+  in `.agentsentry_session_secret`. An optional bearer API key remains for
+  trusted non-browser clients. Keep the API bound to loopback.
 - Baseline model files use joblib/pickle deserialization. Only load models from
   a trusted, write-restricted model directory; see
   [`docs/MODEL_SECURITY.md`](docs/MODEL_SECURITY.md).
@@ -133,7 +134,7 @@ On Windows PowerShell:
 ```powershell
 .\venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+# No .env or browser API key is required for local account sign-in.
 ```
 
 On macOS/Linux:
@@ -141,24 +142,23 @@ On macOS/Linux:
 ```bash
 source venv/bin/activate
 python -m pip install -r requirements.txt
-test -e .env || cp .env.example .env
+# No .env or browser API key is required for local account sign-in.
 ```
 
-Only create `.env` if it does not already exist. Never replace a file
-containing real credentials with the example file. Set `AGENTSENTRY_API_KEY`
-in `.env` to a randomly generated secret with at least 32 characters before
-starting Flask. Keep `.env` private and out of source control. Configure
-`AGENTSENTRY_CORS_ORIGINS` only with the trusted dashboard origins that need
-browser access; the default allows the two loopback Vite origins.
+No `.env` file is required for the local sign-up/sign-in flow. On first
+backend start, AgentSentry creates `.agentsentry_session_secret` for signing
+persistent browser sessions and `.agentsentry_users.sqlite3` when the first
+account is registered. Both are local private files excluded by `.gitignore`.
+Keep `AGENTSENTRY_CORS_ORIGINS` restricted to trusted dashboard origins; the
+default allows the two loopback Vite origins. `AGENTSENTRY_API_KEY` is optional
+and intended only for trusted non-browser clients.
 
 ## Run the application
 
 Start the Flask API from the project root (PowerShell):
 
 ```powershell
-# Or set AGENTSENTRY_API_KEY in the existing .env file before starting.
-$env:AGENTSENTRY_API_KEY = (& .\venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(48))")
-.\venv\Scripts\python.exe -m flask --app api.app:create_app run --host 127.0.0.1 --port 5000
+python -m api.app
 ```
 
 In another terminal, start the dashboard:
@@ -168,10 +168,9 @@ cd dashboard
 npm run dev
 ```
 
-The Vite development server is available at `http://127.0.0.1:5173/`, proxies
-`/api` requests to the loopback Flask API, and prompts for the API key. The key
-is not embedded in the frontend or persisted in browser storage; reloads
-require re-entry. For a production frontend, run `npm run build` in
+The Vite development server is available at `http://127.0.0.1:5173/` and
+proxies `/api` requests to the loopback Flask API. On first visit, create an
+account; subsequent visits use the persistent sign-in session. For a production frontend, run `npm run build` in
 `dashboard` and serve `dashboard/dist` through a trusted static server. The
 Flask development server is not a production server; keep the API private and
 use a separately reviewed deployment boundary before network exposure. See

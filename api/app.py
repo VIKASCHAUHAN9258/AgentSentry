@@ -1,19 +1,23 @@
-"""Read-only Flask API for AgentSentry's persisted SQLite telemetry."""
+"""AgentSentry Flask API for read-only telemetry and local account sessions."""
 from __future__ import annotations
 
 import json
 import hmac
 import os
 import re
+import secrets
 import sqlite3
 from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, session
 from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.security import check_password_hash, generate_password_hash
 
 from core.chain_detector import detect_chains
+from core.demo_mode import DemoModeService, list_demo_scenarios
 from core.telemetry import DB_PATH
 from core.session_review import get_review_status, review_session
 
@@ -21,6 +25,7 @@ IMPLEMENTED = True
 
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _AGENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _SECRET_KEY_RE = re.compile(
     r"(?:password|passwd|secret|token|credential|api[_-]?key|access[_-]?key|private[_-]?key|authorization)",
     re.IGNORECASE,
@@ -33,6 +38,14 @@ _DEFAULT_LIMIT = 50
 _MAX_LIMIT = 200
 _REQUIRED_TABLES = {"sessions", "tool_calls", "tool_definition_events"}
 _LOCAL_CORS_ORIGINS = {"http://127.0.0.1:5173", "http://localhost:5173"}
+_LOCAL_CLIENT_ADDRESSES = {"127.0.0.1", "::1", "localhost"}
+
+
+def _default_demo_data_dir() -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data) / "AgentSentry" / "demo"
+    return Path.home() / ".local" / "share" / "agentsentry" / "demo"
 
 
 def _json_load(value: str | None) -> Any:
@@ -380,15 +393,55 @@ def _risk_for_rows(
     return result
 
 
+def _load_or_create_session_secret(secret_path: Path) -> str:
+    """Load a persistent cookie-signing secret, creating it once for local use."""
+    secret_path = secret_path.expanduser().resolve()
+    secret_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        value = secret_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        value = secrets.token_urlsafe(48)
+        try:
+            descriptor = os.open(secret_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            value = secret_path.read_text(encoding="utf-8").strip()
+        else:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(value + "\n")
+    if len(value) < 32:
+        raise RuntimeError(
+            f"The AgentSentry session secret at {secret_path} is invalid. "
+            "Remove that local file and restart to generate a new one."
+        )
+    return value
+
+
 def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     app = Flask(__name__)
+    project_root = Path(__file__).resolve().parent.parent
+    demo_data_dir = Path(
+        os.environ.get("AGENTSENTRY_DEMO_DATA_DIR", str(_default_demo_data_dir()))
+    ).expanduser()
     app.config.update(
         DATABASE=str(DB_PATH),
+        AUTH_DATABASE=os.environ.get(
+            "AGENTSENTRY_AUTH_DB_PATH", str(project_root / ".agentsentry_users.sqlite3")
+        ),
+        SESSION_SECRET_FILE=os.environ.get(
+            "AGENTSENTRY_SESSION_SECRET_FILE", str(project_root / ".agentsentry_session_secret")
+        ),
+        SECRET_KEY=os.environ.get("AGENTSENTRY_SESSION_SECRET"),
         MODEL_DIR=os.environ.get(
             "AGENTSENTRY_MODEL_DIR",
-            str(Path(__file__).resolve().parent.parent / "models"),
+            str(project_root / "models"),
         ),
+        DEMO_ENABLED=os.environ.get("AGENTSENTRY_DEMO_MODE", "").strip() == "1",
+        DEMO_DATABASE=os.environ.get(
+            "AGENTSENTRY_DEMO_DATABASE", str(demo_data_dir / "telemetry.sqlite3")
+        ),
+        DEMO_MODEL_DIR=str(demo_data_dir / "in-memory-models"),
         MAX_CONTENT_LENGTH=1 * 1024 * 1024,
+        # Optional legacy/service bearer key. Browser users authenticate with accounts.
         API_KEY=os.environ.get("AGENTSENTRY_API_KEY"),
         AUTH_REQUIRED=True,
         CORS_ORIGINS={
@@ -399,6 +452,12 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             ).split(",")
             if origin.strip()
         },
+        SESSION_COOKIE_NAME="agentsentry_session",
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SECURE=os.environ.get("AGENTSENTRY_COOKIE_SECURE", "false").lower() == "true",
+        SESSION_REFRESH_EACH_REQUEST=False,
+        PERMANENT_SESSION_LIFETIME=timedelta(days=7),
         TESTING=False,
         DEBUG=False,
     )
@@ -410,12 +469,20 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         app.config["AUTH_REQUIRED"] = False
     if not app.config["AUTH_REQUIRED"] and not app.config["TESTING"]:
         raise RuntimeError("API authentication may only be disabled in explicit test mode.")
-    if app.config["AUTH_REQUIRED"]:
-        api_key = app.config["API_KEY"]
-        if not isinstance(api_key, str) or len(api_key) < 32:
-            raise RuntimeError(
-                "Set AGENTSENTRY_API_KEY to a randomly generated secret of at least 32 characters."
+
+    # Tests use a deterministic throwaway key. Local runs create one persistent
+    # secret file so signed browser sessions survive ordinary server restarts.
+    if not app.config.get("SECRET_KEY"):
+        if app.config["TESTING"]:
+            app.config["SECRET_KEY"] = "agentsentry-test-only-session-secret"
+        else:
+            app.config["SECRET_KEY"] = _load_or_create_session_secret(
+                Path(app.config["SESSION_SECRET_FILE"])
             )
+    if not isinstance(app.config["SECRET_KEY"], str) or len(app.config["SECRET_KEY"]) < 32:
+        raise RuntimeError("AGENTSENTRY_SESSION_SECRET must contain at least 32 characters.")
+
+    app.config["SESSION_COOKIE_PATH"] = "/"
 
     def connect() -> sqlite3.Connection:
         database_uri = f"{Path(app.config['DATABASE']).resolve().as_uri()}?mode=ro"
@@ -434,6 +501,213 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     def error(message: str, status: int):
         return jsonify({"error": message}), status
 
+    def demo_service() -> DemoModeService:
+        service = app.extensions.get("agentsentry_demo_service")
+        database_path = Path(app.config["DEMO_DATABASE"]).expanduser().resolve()
+        if not isinstance(service, DemoModeService) or service.database_path != database_path:
+            service = DemoModeService(database_path)
+            app.extensions["agentsentry_demo_service"] = service
+        return service
+
+    def demo_database_is_separate() -> bool:
+        demo_database = Path(app.config["DEMO_DATABASE"]).expanduser().resolve()
+        protected_databases = {
+            Path(app.config["DATABASE"]).expanduser().resolve(),
+            Path(app.config["AUTH_DATABASE"]).expanduser().resolve(),
+        }
+        if demo_database in protected_databases:
+            return False
+        return not any(
+            protected.exists()
+            and demo_database.exists()
+            and os.path.samefile(demo_database, protected)
+            for protected in protected_databases
+        )
+
+    def demo_access_error():
+        if request.remote_addr not in _LOCAL_CLIENT_ADDRESSES:
+            return error("SOC Demo Mode is restricted to localhost.", 403)
+        if not app.config["DEMO_ENABLED"]:
+            return error("SOC Demo Mode is disabled for this backend.", 404)
+        if not demo_database_is_separate():
+            return error(
+                "The demo database must be separate from telemetry and user accounts.",
+                500,
+            )
+        return None
+
+    def demo_model_cache(agent_ids: set[str]) -> dict[str, tuple[dict[str, str], Any | None]]:
+        cache = app.extensions.setdefault("agentsentry_demo_model_cache", {})
+        from core.detector import BehaviorAnomalyDetector
+        from core.features import extract_session_features
+        from lab.synthetic import benign_sessions
+
+        baseline_profiles = {
+            "demo-code-reviewer": "demo-code-reviewer",
+            "demo-research-assistant": "research-assistant",
+            "demo-suspicious-agent": "demo-code-reviewer",
+            "demo-attack-chain": "research-assistant",
+        }
+        for agent_id in sorted(agent_ids):
+            if agent_id in cache:
+                continue
+            profile = baseline_profiles[agent_id]
+            baseline_sessions = benign_sessions(profile, 40, seed_start=1000)
+            vectors = [
+                extract_session_features(f"demo-baseline-{index}", rows).to_vector()
+                for index, rows in enumerate(baseline_sessions)
+            ]
+            detector = BehaviorAnomalyDetector(
+                agent_id,
+                model_dir=Path(app.config["DEMO_MODEL_DIR"]),
+            )
+            detector.fit(vectors)
+            cache[agent_id] = (
+                {
+                    "status": "LOADED",
+                    "reason": "Deterministic in-memory synthetic reference baseline.",
+                },
+                detector,
+            )
+        return cache
+
+    def demo_payload(run_id: str | None = None) -> dict[str, Any]:
+        base = {
+            "enabled": bool(app.config["DEMO_ENABLED"]),
+            "classification": "SIMULATED",
+            "model_disclosure": (
+                "Session features, policy rules, Isolation Forest scoring, and chain "
+                "correlation use the production pipeline. The detector is fitted in "
+                "memory to deterministic synthetic benign reference sessions; no "
+                "model files are loaded or written, and these results are not "
+                "real-world detections."
+            ),
+            "scenarios": list_demo_scenarios(),
+            "active_run": None,
+            "metrics": {
+                "sessions_total": 0,
+                "tool_calls_total": 0,
+                "agents_total": 0,
+                "alerts_total": 0,
+            },
+            "alerts": [],
+        }
+        if not app.config["DEMO_ENABLED"]:
+            return base
+        run = demo_service().read_run(run_id)
+        if run is None:
+            return base
+
+        model_cache = demo_model_cache(
+            {scenario["agent_id"] for scenario in run["scenarios"]}
+        )
+        assessed_scenarios = []
+        alerts: list[dict[str, Any]] = []
+        tool_call_total = 0
+        for scenario in run["scenarios"]:
+            session = scenario["session"]
+            calls = scenario["calls"]
+            timeline = build_timeline(calls, [])
+            assessment = _risk_for_rows(
+                scenario["agent_id"],
+                session["session_id"],
+                calls,
+                timeline,
+                Path(app.config["DEMO_MODEL_DIR"]),
+                model_cache,
+            )
+            display_calls = []
+            for call in calls:
+                item = dict(call)
+                item["arguments"] = _redact(_json_load(item.pop("arguments_json")))
+                item["result_summary"] = _redact(item["result_summary"])
+                item["classification"] = "SIMULATED"
+                display_calls.append(item)
+            tool_call_total += len(display_calls)
+            assessment["classification"] = "SIMULATED"
+            assessed = {
+                "scenario_id": scenario["scenario_id"],
+                "scenario_name": scenario["scenario_name"],
+                "description": next(
+                    item["description"]
+                    for item in base["scenarios"]
+                    if item["id"] == scenario["scenario_id"]
+                ),
+                "agent_id": scenario["agent_id"],
+                "session": session,
+                "calls": display_calls,
+                "assessment": assessment,
+                "review": scenario["review"],
+                "classification": "SIMULATED",
+            }
+            assessed_scenarios.append(assessed)
+            if (
+                assessment["risk_level"] in {"HIGH", "CRITICAL"}
+                or assessment["policy_violations"]
+                or assessment["attack_chains"]
+            ):
+                alerts.append(
+                    {
+                        "alert_id": f"{run['run_id']}:{scenario['scenario_id']}",
+                        "run_id": run["run_id"],
+                        "scenario_id": scenario["scenario_id"],
+                        "scenario_name": scenario["scenario_name"],
+                        "agent_id": scenario["agent_id"],
+                        "session_id": session["session_id"],
+                        "risk_level": assessment["risk_level"],
+                        "risk_score": assessment["final_risk_score"],
+                        "why_flagged": assessment["why_flagged"],
+                        "contributing_signals": assessment["contributing_signals"],
+                        "classification": "SIMULATED",
+                    }
+                )
+        base["active_run"] = {
+            "run_id": run["run_id"],
+            "created_at": run["created_at"],
+            "scenarios": assessed_scenarios,
+        }
+        base["alerts"] = alerts
+        base["metrics"] = {
+            "sessions_total": len(assessed_scenarios),
+            "tool_calls_total": tool_call_total,
+            "agents_total": len({item["agent_id"] for item in assessed_scenarios}),
+            "alerts_total": len(alerts),
+        }
+        return base
+
+    def bearer_is_authenticated() -> bool:
+        configured_key = app.config.get("API_KEY")
+        if not isinstance(configured_key, str) or len(configured_key) < 32:
+            return False
+        authorization = request.headers.get("Authorization", "")
+        scheme, separator, supplied_key = authorization.partition(" ")
+        return bool(
+            scheme == "Bearer"
+            and separator
+            and supplied_key
+            and hmac.compare_digest(
+                supplied_key.encode("utf-8"), configured_key.encode("utf-8")
+            )
+        )
+
+    def current_user() -> dict[str, Any] | None:
+        user = session.get("user")
+        if not isinstance(user, dict):
+            return None
+        if not isinstance(user.get("id"), int) or not isinstance(user.get("email"), str):
+            return None
+        return {"id": user["id"], "name": str(user.get("name", "")), "email": user["email"]}
+
+    def csrf_is_valid() -> bool:
+        expected = session.get("csrf_token")
+        supplied = request.headers.get("X-CSRF-Token", "")
+        return bool(
+            isinstance(expected, str)
+            and expected
+            and supplied
+            and hmac.compare_digest(expected.encode("utf-8"), supplied.encode("utf-8"))
+        )
+
     @app.before_request
     def enforce_api_access():
         if not request.path.startswith("/api/"):
@@ -448,30 +722,34 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             response = app.response_class(status=204)
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
             response.headers["Access-Control-Allow-Headers"] = (
-                "Accept, Authorization, Content-Type"
+                "Accept, Authorization, Content-Type, X-CSRF-Token"
             )
             response.headers["Access-Control-Max-Age"] = "600"
             return response
 
-        if request.path in {"/api/health", "/api/auth/status"}:
+        if request.path == "/api/health":
             return None
         if not app.config["AUTH_REQUIRED"]:
             return None
 
-        authorization = request.headers.get("Authorization", "")
-        scheme, separator, supplied_key = authorization.partition(" ")
-        if (
-            scheme != "Bearer"
-            or not separator
-            or not supplied_key
-            or not hmac.compare_digest(
-                supplied_key.encode("utf-8"),
-                app.config["API_KEY"].encode("utf-8"),
-            )
-        ):
-            response, status = error("Valid bearer credentials are required", 401)
-            response.headers["WWW-Authenticate"] = 'Bearer realm="AgentSentry API"'
+        # Account creation and login are public routes, protected by a short-lived
+        # CSRF token issued by /api/auth/status and by the exact Origin allowlist.
+        if request.path in {"/api/auth/status", "/api/auth/signup", "/api/auth/login"}:
+            if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not csrf_is_valid():
+                return error("A valid CSRF token is required. Refresh the page and try again.", 403)
+            return None
+
+        bearer_auth = bearer_is_authenticated()
+        if not bearer_auth and current_user() is None:
+            response, status = error("Sign in to access AgentSentry.", 401)
+            response.headers["WWW-Authenticate"] = 'Bearer realm="AgentSentry API", Session realm="AgentSentry"'
             return response, status
+
+        # Cookie-authenticated state-changing requests must prove same-session
+        # intent. Bearer clients are exempt because the token is not ambient.
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not bearer_auth:
+            if not csrf_is_valid():
+                return error("A valid CSRF token is required. Refresh the page and try again.", 403)
         return None
 
     @app.after_request
@@ -479,8 +757,45 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         origin = request.headers.get("Origin")
         if origin and origin in app.config["CORS_ORIGINS"]:
             response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
             response.headers["Vary"] = "Origin"
         return response
+
+    @contextmanager
+    def auth_connection() -> Iterator[sqlite3.Connection]:
+        auth_path = Path(app.config["AUTH_DATABASE"]).expanduser().resolve()
+        auth_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(auth_path, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    email TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                )"""
+            )
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def establish_user(user_row: sqlite3.Row) -> dict[str, Any]:
+        session.clear()
+        session.permanent = True
+        user = {
+            "id": int(user_row["id"]),
+            "name": str(user_row["name"]),
+            "email": str(user_row["email"]),
+        }
+        session["user"] = user
+        session["csrf_token"] = secrets.token_urlsafe(32)
+        return user
 
     def schema_is_available(conn: sqlite3.Connection) -> bool:
         rows = conn.execute(
@@ -598,11 +913,184 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
 
     @app.get("/api/auth/status")
     def auth_status():
-        return jsonify({"required": bool(app.config["AUTH_REQUIRED"])})
+        if not session.get("csrf_token"):
+            session["csrf_token"] = secrets.token_urlsafe(32)
+        user = current_user()
+        authenticated = (
+            not app.config["AUTH_REQUIRED"]
+            or user is not None
+            or bearer_is_authenticated()
+        )
+        return jsonify(
+            {
+                "required": bool(app.config["AUTH_REQUIRED"]),
+                "authenticated": authenticated,
+                "user": user,
+                "csrf_token": session["csrf_token"],
+            }
+        )
+
+    @app.post("/api/auth/signup")
+    def auth_signup():
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return error("A JSON request body is required.", 400)
+        name = str(payload.get("name", "")).strip()
+        email = str(payload.get("email", "")).strip().lower()
+        password = payload.get("password")
+        if not name or len(name) > 80:
+            return error("Name must contain between 1 and 80 characters.", 400)
+        if len(email) > 254 or not _EMAIL_RE.fullmatch(email):
+            return error("Enter a valid email address.", 400)
+        if not isinstance(password, str) or len(password) < 12 or len(password) > 128:
+            return error("Password must contain between 12 and 128 characters.", 400)
+        try:
+            with auth_connection() as conn:
+                cursor = conn.execute(
+                    "INSERT INTO users (name, email, password_hash, created_at) VALUES (?, ?, ?, strftime('%s','now'))",
+                    (name, email, generate_password_hash(password, method="scrypt")),
+                )
+                user_row = conn.execute(
+                    "SELECT id, name, email FROM users WHERE id = ?", (cursor.lastrowid,)
+                ).fetchone()
+        except sqlite3.IntegrityError:
+            return error("An account with this email already exists. Sign in instead.", 409)
+        except sqlite3.Error:
+            app.logger.exception("Unable to create local AgentSentry account")
+            return error("Unable to create the account. Try again.", 500)
+        user = establish_user(user_row)
+        return jsonify(
+            {"authenticated": True, "user": user, "csrf_token": session["csrf_token"]}
+        ), 201
+
+    @app.post("/api/auth/login")
+    def auth_login():
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return error("A JSON request body is required.", 400)
+        email = str(payload.get("email", "")).strip().lower()
+        password = payload.get("password")
+        if len(email) > 254 or not _EMAIL_RE.fullmatch(email) or not isinstance(password, str):
+            return error("Email or password is incorrect.", 401)
+        try:
+            with auth_connection() as conn:
+                user_row = conn.execute(
+                    "SELECT id, name, email, password_hash FROM users WHERE email = ? COLLATE NOCASE",
+                    (email,),
+                ).fetchone()
+        except sqlite3.Error:
+            app.logger.exception("Unable to read local AgentSentry account")
+            return error("Unable to sign in. Try again.", 500)
+        if user_row is None or not check_password_hash(user_row["password_hash"], password):
+            return error("Email or password is incorrect.", 401)
+        user = establish_user(user_row)
+        return jsonify(
+            {"authenticated": True, "user": user, "csrf_token": session["csrf_token"]}
+        )
+
+    @app.post("/api/auth/logout")
+    def auth_logout():
+        session.clear()
+        return jsonify({"logged_out": True})
 
     @app.get("/api/auth/verify")
     def auth_verify():
-        return jsonify({"authenticated": True})
+        payload = {"authenticated": True}
+        user = current_user()
+        if user is not None:
+            payload["user"] = user
+        return jsonify(payload)
+
+    @app.get("/api/demo")
+    def get_demo_data():
+        if request.remote_addr not in _LOCAL_CLIENT_ADDRESSES:
+            return error("SOC Demo Mode is restricted to localhost.", 403)
+        if app.config["DEMO_ENABLED"] and not demo_database_is_separate():
+            return error(
+                "The demo database must be separate from telemetry and user accounts.",
+                500,
+            )
+        try:
+            return jsonify(demo_payload())
+        except (OSError, sqlite3.Error):
+            app.logger.exception("Unable to read isolated SOC demo data")
+            return error("Unable to read SOC demo data.", 500)
+
+    @app.post("/api/demo/load")
+    def load_demo_data():
+        access_error = demo_access_error()
+        if access_error:
+            return access_error
+        if not request.is_json:
+            return error("Content-Type must be application/json.", 415)
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return error("A JSON request object is required.", 400)
+        scenario_id = payload.get("scenario_id")
+        if scenario_id is not None and not isinstance(scenario_id, str):
+            return error("scenario_id must be text.", 400)
+        try:
+            run_id = demo_service().load(scenario_id)
+            return jsonify(demo_payload(run_id)), 201
+        except ValueError as exc:
+            return error(str(exc), 400)
+        except RuntimeError as exc:
+            return error(str(exc), 409)
+        except (OSError, sqlite3.Error):
+            app.logger.exception("Unable to load isolated SOC demo data")
+            return error("Unable to load SOC demo data.", 500)
+
+    @app.post("/api/demo/reset")
+    def reset_demo_data():
+        access_error = demo_access_error()
+        if access_error:
+            return access_error
+        if not request.is_json:
+            return error("Content-Type must be application/json.", 415)
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return error("A JSON request object is required.", 400)
+        run_id = payload.get("run_id")
+        if not isinstance(run_id, str) or not re.fullmatch(r"[a-f0-9]{32}", run_id):
+            return error("A valid demo run_id is required.", 400)
+        try:
+            if not demo_service().reset(run_id):
+                return error("Demo run not found.", 404)
+            return jsonify(demo_payload())
+        except (OSError, sqlite3.Error, ValueError):
+            app.logger.exception("Unable to reset isolated SOC demo data")
+            return error("Unable to reset SOC demo data.", 500)
+
+    @app.post("/api/demo/runs/<run_id>/sessions/<session_id>/review")
+    def review_demo_session(run_id: str, session_id: str):
+        access_error = demo_access_error()
+        if access_error:
+            return access_error
+        if not re.fullmatch(r"[a-f0-9]{32}", run_id) or not valid_session_id(session_id):
+            return error("Invalid demo run or session identifier.", 400)
+        if not request.is_json:
+            return error("Content-Type must be application/json.", 415)
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return error("A JSON review object is required.", 400)
+        service = demo_service()
+        if not service.session_belongs_to_run(run_id, session_id):
+            return error("Demo session not found in this run.", 404)
+        try:
+            result = review_session(
+                Path(app.config["DEMO_DATABASE"]),
+                session_id,
+                payload.get("decision"),
+                payload.get("reviewer"),
+                payload.get("note", ""),
+                payload.get("confirm_reviewed") is True,
+            )
+            return jsonify(result), 201
+        except ValueError as exc:
+            return error(str(exc), 400)
+        except (OSError, sqlite3.Error):
+            app.logger.exception("Unable to record SOC demo investigation")
+            return error("Unable to record the demo investigation.", 500)
 
     @app.get("/api/agents")
     def agents():

@@ -6,6 +6,7 @@ import {
   SessionDetailPage,
   SessionsPage,
 } from "./pages";
+import { DemoPage } from "./DemoPage";
 
 export function AppRoutes() {
   return (
@@ -13,6 +14,7 @@ export function AppRoutes() {
       <Route path="/" element={<OverviewPage />} />
       <Route path="/sessions" element={<SessionsPage />} />
       <Route path="/sessions/:sessionId" element={<SessionDetailPage />} />
+      <Route path="/demo" element={<DemoPage />} />
       <Route path="/investigations" element={<InvestigationsPage />} />
       <Route path="/mcp" element={<McpPage />} />
       <Route path="*" element={<Navigate to="/" replace />} />

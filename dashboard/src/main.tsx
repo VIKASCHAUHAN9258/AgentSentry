@@ -9,6 +9,7 @@ import "./styles/global.css";
 import "./styles/dashboard.css";
 import "./styles/phase85.css";
 import "./styles/auth.css";
+import "./styles/demo.css";
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
